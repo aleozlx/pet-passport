@@ -49,6 +49,15 @@ the published mapping from observed evidence to the words used to describe it. I
 mechanical, versioned, and auditable by someone who disagrees with a specific call. Any
 change to how an observation is worded is a change to that table, not a copy edit.
 
+It follows that the mapping lives in a data file in this repository, not in string literals
+scattered through the code — a table nobody can read as a table is not auditable.
+
+Note the distinction this creates, because it is easy to misread §1 as forbidding it: a
+structured, versioned schema for that **input** data file is correct and wanted. The
+prohibition is on a schema for report **output**. Configuration the project publishes and
+stands behind is the opposite of a machine-readable result format that invites others to
+build gates on it.
+
 ## 5. Rules for the agent
 
 1. Read `docs/design.md` before proposing or implementing any feature.
