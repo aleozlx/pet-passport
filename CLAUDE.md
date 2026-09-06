@@ -35,12 +35,13 @@ diff for identifying terms and satisfy yourself that nothing crossed over.
 This rule is one-directional and absolute: it does not matter that the two projects are
 related, that the detail seems harmless, or that it would make an example clearer.
 
-## 3. Stack: deliberately undecided
+## 3. Stack: Rust with goblin
 
-No language, framework, or binary-parsing library has been chosen. Do not settle this by
-starting to write code in something — a stack picked as a side effect of the first commit is
-a stack nobody argued about. Raise it as its own decision when implementation actually
-begins.
+Pet Passport is implemented in Rust, using the `goblin` crate for PE parsing. It is a single,
+self-contained binary with no runtime for a user to install. This fits the trust model: a
+person can fetch a fresh copy themselves and run it, without first accepting a separate
+runtime installation or a tool bundled by the party being examined. `goblin` was selected in
+the prior assessment as a mature, small PE-parsing crate.
 
 ## 4. The mapping table is the credibility
 

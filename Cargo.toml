@@ -1,0 +1,14 @@
+[package]
+name = "pet-passport"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "A descriptive static reader for Windows PE binaries"
+
+[dependencies]
+# goblin provides the deliberately selected, small PE parsing layer.
+goblin = "0.9"
+# sha2 identifies the examined artifact without making a network request.
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
