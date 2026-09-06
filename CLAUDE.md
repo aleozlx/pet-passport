@@ -35,12 +35,15 @@ diff for identifying terms and satisfy yourself that nothing crossed over.
 This rule is one-directional and absolute: it does not matter that the two projects are
 related, that the detail seems harmless, or that it would make an example clearer.
 
-## 3. Stack: deliberately undecided
+## 3. Stack: Go, standard library only
 
-No language, framework, or binary-parsing library has been chosen. Do not settle this by
-starting to write code in something — a stack picked as a side effect of the first commit is
-a stack nobody argued about. Raise it as its own decision when implementation actually
-begins.
+The implementation is Go with zero third-party dependencies. The credibility of this tool
+rests on being auditable by people who have no reason to trust its author, so a reader must
+be able to review the whole thing without also reviewing a dependency tree. Go's standard
+library covers binary parsing, hashing, and configuration outright. Memory safety is required
+because the tool parses deliberately hostile input, which rules out C and C++. Go additionally
+cross-compiles trivially and builds reproducibly, both of which matter for a tool people are
+asked to rebuild and verify themselves.
 
 ## 4. The mapping table is the credibility
 

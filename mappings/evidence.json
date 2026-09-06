@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "mapping_version": "2026-09-06",
+  "mapping": [
+    {"dll":"user32.dll","symbol":"GetDC","area":"screen capture","wording":"Obtains a device context for a window or the screen (GetDC)."},
+    {"dll":"gdi32.dll","symbol":"BitBlt","area":"screen capture","wording":"Copies pixels between device contexts (BitBlt)."},
+    {"dll":"wininet.dll","symbol":"InternetOpenUrlW","area":"network","wording":"Opens a URL through WinINet (InternetOpenUrlW)."},
+    {"dll":"winhttp.dll","symbol":"WinHttpSendRequest","area":"network","wording":"Sends an HTTP request through WinHTTP (WinHttpSendRequest)."},
+    {"dll":"ws2_32.dll","symbol":"connect","area":"network","wording":"Connects a Winsock socket (connect)."},
+    {"dll":"kernel32.dll","dll_aliases":["api-ms-win-core-file-l1-1-0.dll"],"symbol":"CreateFileW","area":"filesystem","wording":"Opens or creates a filesystem object (CreateFileW)."},
+    {"dll":"kernel32.dll","dll_aliases":["api-ms-win-core-file-l1-1-0.dll"],"symbol":"DeleteFileW","area":"filesystem","wording":"Deletes a filesystem object (DeleteFileW)."},
+    {"dll":"advapi32.dll","dll_aliases":["api-ms-win-core-registry-l1-1-0.dll"],"symbol":"RegOpenKeyExW","area":"registry and persistence","wording":"Opens a Registry key (RegOpenKeyExW)."},
+    {"dll":"advapi32.dll","dll_aliases":["api-ms-win-core-registry-l1-1-0.dll"],"symbol":"RegSetValueExW","area":"registry and persistence","wording":"Writes a Registry value (RegSetValueExW)."},
+    {"dll":"shell32.dll","symbol":"SHGetFolderPathW","area":"registry and persistence","wording":"Obtains a known shell-folder path (SHGetFolderPathW)."},
+    {"dll":"user32.dll","symbol":"GetKeyboardState","area":"input reading","wording":"Reads the current state of virtual keyboard keys (GetKeyboardState)."},
+    {"dll":"user32.dll","symbol":"GetAsyncKeyState","area":"input reading","wording":"Reads the current state of one virtual key (GetAsyncKeyState)."},
+    {"dll":"kernel32.dll","dll_aliases":["api-ms-win-core-processthreads-l1-1-0.dll"],"symbol":"CreateProcessW","area":"process and thread creation","wording":"Creates a new process and its primary thread (CreateProcessW)."},
+    {"dll":"kernel32.dll","symbol":"CreateThread","area":"process and thread creation","wording":"Creates a thread in the current process (CreateThread)."},
+    {"dll":"user32.dll","symbol":"OpenClipboard","area":"clipboard","wording":"Opens the clipboard for access (OpenClipboard)."},
+    {"dll":"user32.dll","symbol":"GetClipboardData","area":"clipboard","wording":"Retrieves data from the clipboard (GetClipboardData)."},
+    {"dll":"user32.dll","symbol":"SetClipboardData","area":"clipboard","wording":"Places data on the clipboard (SetClipboardData)."}
+  ]
+}
