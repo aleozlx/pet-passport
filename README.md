@@ -53,6 +53,17 @@ go build
 pet-passport C:\path\to\some-pet.exe
 ```
 
+Run it with no arguments and it examines every Windows PE file it finds directly in the
+current directory instead (not recursive), printing each file's report in turn, separated by
+a delimiter line, followed by a closing paragraph naming anything present that was not a PE
+image and so was not examined. No file is special-cased, including the passport binary
+itself if it happens to be sitting in that directory.
+
+Double-clicking the exe in Explorer opens a console that closes the instant the program
+exits, so on Windows Pet Passport always prints `Press Enter to close.` and waits before
+exiting when its output is going to a console. Redirect the output to a file and it exits
+immediately.
+
 A report is prose, not a table, and its exact wording is free to change between releases.
 Here is a short excerpt from running the tool against `C:\Windows\System32\notepad.exe`:
 

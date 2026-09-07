@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -75,22 +76,156 @@ type inspection struct {
 	Mapping         evidenceTable
 }
 
+const usageText = `Usage: pet-passport [path-to-windows-pe-binary]
+  With a path argument: examine that one Windows PE binary.
+  With no arguments: examine every Windows PE file in the current directory.`
+
+// main only ever calls os.Exit once, from the outermost frame, after run has
+// already returned. run itself never calls os.Exit: it defers maybePause,
+// and a deferred call does not run if the function that deferred it is
+// short-circuited by os.Exit instead of returning normally. Every exit path
+// below therefore has to return an int instead.
 func main() {
-	if len(os.Args) != 2 {
-		fmt.Fprintln(os.Stderr, "Please provide a path to one Windows PE binary.")
-		os.Exit(2)
+	os.Exit(run())
+}
+
+func run() int {
+	defer maybePause()
+	switch len(os.Args) {
+	case 1:
+		return runDirectoryScan(os.Stdout, ".")
+	case 2:
+		return runSingleFile(os.Stdout, os.Args[1])
+	default:
+		fmt.Fprintln(os.Stderr, usageText)
+		return 2
 	}
-	raw, err := os.ReadFile(os.Args[1])
+}
+
+func runSingleFile(out io.Writer, path string) int {
+	raw, err := os.ReadFile(path)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Pet Passport could not read %q: %v\n", os.Args[1], err)
-		os.Exit(1)
+		fmt.Fprintf(os.Stderr, "Pet Passport could not read %q: %v\n", path, err)
+		return 1
 	}
-	result, err := inspectPE(raw, os.Args[1])
+	result, err := inspectPE(raw, path)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%q is not a PE file; Pet Passport examines Windows PE files only.\n", os.Args[1])
-		os.Exit(1)
+		fmt.Fprintf(os.Stderr, "%q is not a PE file; Pet Passport examines Windows PE files only.\n", path)
+		return 1
 	}
-	writeReport(os.Stdout, result)
+	writeReport(out, result)
+	return 0
+}
+
+// peCandidate is a regular file from a directory scan whose first two bytes
+// are the "MZ" DOS header, along with the bytes already read to check that,
+// so runDirectoryScan does not have to read the file a second time.
+type peCandidate struct {
+	Name string
+	Raw  []byte
+}
+
+// skippedFile is a regular file from a directory scan that was not examined,
+// and why.
+type skippedFile struct {
+	Name   string
+	Reason string
+}
+
+func hasMZHeader(raw []byte) bool {
+	return len(raw) >= 2 && raw[0] == 'M' && raw[1] == 'Z'
+}
+
+// scanDirectory lists the regular files directly in dir, in the order
+// os.ReadDir returns them (by name; not recursive; nothing hidden-file
+// special about it), and separates them by whether their first two bytes
+// are "MZ". It does not attempt a full PE parse - a candidate whose MZ
+// header turns out not to be a real PE image is handled by the caller,
+// once it tries to build that file's report.
+func scanDirectory(dir string) (candidates []peCandidate, skipped []skippedFile, err error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() {
+			continue
+		}
+		if candidate, skip := classifyRegularFile(dir, entry.Name()); skip != nil {
+			skipped = append(skipped, *skip)
+		} else {
+			candidates = append(candidates, *candidate)
+		}
+	}
+	return candidates, skipped, nil
+}
+
+// classifyRegularFile reads name from dir and reports whether its first two
+// bytes are the "MZ" DOS header. Exactly one return value is non-nil: a
+// *peCandidate for a file worth a full report, or a *skippedFile explaining
+// why it is not (the read itself failed, or the header does not match).
+func classifyRegularFile(dir, name string) (*peCandidate, *skippedFile) {
+	raw, err := os.ReadFile(filepath.Join(dir, name))
+	if err != nil {
+		return nil, &skippedFile{Name: name, Reason: fmt.Sprintf("could not be opened: %v", err)}
+	}
+	if !hasMZHeader(raw) {
+		return nil, &skippedFile{Name: name, Reason: "not a Windows PE image"}
+	}
+	return &peCandidate{Name: name, Raw: raw}, nil
+}
+
+// reportDelimiter separates one file's report from the next (or from the
+// closing paragraph) when scanning a directory, so a reader can always tell
+// where one report ends and another begins.
+const reportDelimiter = "----------------------------------------------------------------------"
+
+func writeDelimiter(out io.Writer) {
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, reportDelimiter)
+	fmt.Fprintln(out)
+}
+
+func runDirectoryScan(out io.Writer, dir string) int {
+	candidates, skipped, err := scanDirectory(dir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Pet Passport could not list %q: %v\n", dir, err)
+		return 1
+	}
+	examined := 0
+	for _, c := range candidates {
+		result, err := inspectPE(c.Raw, c.Name)
+		if err != nil {
+			skipped = append(skipped, skippedFile{Name: c.Name, Reason: fmt.Sprintf("has an MZ header but could not be read as a Windows PE image: %v", err)})
+			continue
+		}
+		writeReport(out, result)
+		writeDelimiter(out)
+		examined++
+	}
+	writeClosingParagraph(out, examined, skipped)
+	return 0
+}
+
+// writeClosingParagraph reports, in prose, what was present in the scanned
+// directory but not examined - no file is silently left out of the account,
+// per the same "report what could not be examined" rule a single report
+// follows for its own blind spots.
+func writeClosingParagraph(out io.Writer, examined int, skipped []skippedFile) {
+	if examined == 0 {
+		fmt.Fprintln(out, "No Windows PE files were found in the current directory.")
+		return
+	}
+	if len(skipped) == 0 {
+		fmt.Fprintln(out, "Every regular file in the current directory was examined above.")
+		return
+	}
+	sort.Slice(skipped, func(i, j int) bool { return strings.ToLower(skipped[i].Name) < strings.ToLower(skipped[j].Name) })
+	parts := make([]string, 0, len(skipped))
+	for _, s := range skipped {
+		parts = append(parts, fmt.Sprintf("%q (%s)", s.Name, s.Reason))
+	}
+	fmt.Fprintf(out, "The following file(s) were present in the current directory but not examined because they are not Windows PE images or could not be opened: %s.\n", joinProse(parts))
 }
 
 func inspectPE(raw []byte, path string) (*inspection, error) {
@@ -143,7 +278,7 @@ func readImports(f *pe.File) ([]importSymbol, error) {
 	return imports, nil
 }
 
-func writeReport(out *os.File, r *inspection) {
+func writeReport(out io.Writer, r *inspection) {
 	hash := sha256.Sum256(r.Raw)
 	fmt.Fprintf(out, "Pet Passport %s read %q. This is a static reading of that one file, not a judgment about it.\n\n", reportedVersion(), filepath.Clean(r.ImagePath))
 	fmt.Fprintln(out, "Self-reported identity (unverified)")
@@ -159,7 +294,7 @@ func writeReport(out *os.File, r *inspection) {
 	fmt.Fprintln(out, "What this tool cannot see")
 	fmt.Fprintln(out, "This is a static reading of one file. It cannot see code produced after launch, decrypted or downloaded content, direct system calls, user-triggered paths, or what the program actually does on a particular machine. Dynamic and behavioral analysis tools, such as a sandbox, system-call monitor, network capture, or debugger, can observe kinds of runtime behavior that this report cannot.")
 }
-func writeIdentity(out *os.File, id identity) {
+func writeIdentity(out io.Writer, id identity) {
 	if id.ProductName == "" {
 		fmt.Fprintln(out, "No self-reported product name was found in a VERSIONINFO resource.")
 	} else {
@@ -176,7 +311,7 @@ func writeIdentity(out *os.File, id identity) {
 		fmt.Fprintf(out, "The self-reported company is %q; it is unverified.\n", id.Company)
 	}
 }
-func writeImports(out *os.File, r *inspection) {
+func writeImports(out io.Writer, r *inspection) {
 	if r.ImportReadErr != nil {
 		fmt.Fprintf(out, "The import table could not be read completely: %v. This does not make the static picture complete.\n", r.ImportReadErr)
 		return
@@ -233,7 +368,7 @@ func joinProse(values []string) string {
 	}
 	return strings.Join(values[:len(values)-1], ", ") + ", and " + values[len(values)-1]
 }
-func writeBlindSpots(out *os.File, r *inspection) {
+func writeBlindSpots(out io.Writer, r *inspection) {
 	hasLoadLibrary, hasGetProcAddress := false, false
 	for _, imp := range r.Imports {
 		if strings.EqualFold(imp.Symbol, "LoadLibraryA") || strings.EqualFold(imp.Symbol, "LoadLibraryW") || strings.EqualFold(imp.Symbol, "LoadLibrary") {
