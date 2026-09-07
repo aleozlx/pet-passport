@@ -16,7 +16,10 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // passportVersion is normally set at build time via
@@ -67,6 +70,7 @@ type inspection struct {
 	Raw             []byte
 	SHA256          string
 	Identity        identity
+	Manifest        manifestObservation
 	Imports         []importSymbol
 	ImportReadErr   error
 	TLSCallbacks    int
@@ -222,26 +226,66 @@ func runDirectoryScan(out io.Writer, dir string, selfHash string) int {
 		}
 		results = append(results, result)
 	}
-	results = orderForReport(results, selfHash)
-	if len(results) > 0 {
-		writeTableOfContents(out, results)
+	pets, nonPets := partitionPets(results)
+	skipped = append(skipped, nonPets...)
+	pets = orderForReport(pets, selfHash)
+	if len(pets) > 0 {
+		writeTableOfContents(out, pets)
 		fmt.Fprintln(out)
 	}
-	for _, result := range results {
+	for _, result := range pets {
 		writeReport(out, result, selfHash)
 		writeDelimiter(out)
 	}
-	writeClosingParagraph(out, len(results), skipped)
+	writeClosingParagraph(out, len(pets), skipped)
 	return 0
 }
 
-// orderForReport reorders inspected files so that a file whose SHA-256
+// partitionPets splits examined PE files into the ones that declare
+// themselves with a pet_passport_v1 export and the ones that do not. Only the
+// first group gets a report in directory mode: a directory holding a pet
+// usually also holds the runtime, the installer, and this passport's own
+// copy, and a full report on each of those buries the file the reader
+// actually came for.
+//
+// A file carrying an export whose payload did not parse is still a pet by
+// this test. It declared itself; the report then says the declaration could
+// not be read, which is a finding rather than a reason for silence. The
+// second group is not discarded either - every name reappears in the closing
+// paragraph, because a file examined and left out of the account is exactly
+// the quiet this design refuses.
+func partitionPets(results []*inspection) (pets []*inspection, others []skippedFile) {
+	for _, r := range results {
+		switch {
+		case r.Manifest.Found:
+			pets = append(pets, r)
+		case r.Manifest.ExportErr != nil:
+			others = append(others, skippedFile{
+				Name:   filepath.Base(filepath.Clean(r.ImagePath)),
+				Reason: fmt.Sprintf("examined; its export directory could not be read completely (%v), so no %s export could be confirmed either way", r.Manifest.ExportErr, manifestSymbolName),
+			})
+		default:
+			others = append(others, skippedFile{
+				Name:   filepath.Base(filepath.Clean(r.ImagePath)),
+				Reason: fmt.Sprintf("examined; not a pet (no %s export)", manifestSymbolName),
+			})
+		}
+	}
+	return pets, others
+}
+
+// orderForReport reorders reported files so that a file whose SHA-256
 // matches the running passport's own goes last, keeping the relative order
 // of every other file (the name order scanDirectory already produced). It
 // is the least interesting report to the person who ran the tool, since it
 // is a report about the tool itself rather than about a pet; this only
 // changes where it appears, not what its report says. If selfHash is
 // unknown, or no file matches, the order is unchanged.
+//
+// Since directory mode reports only files carrying the manifest export, and
+// this passport carries none, its own copy in a scanned directory is now
+// named in the closing paragraph rather than reported. This ordering is what
+// would happen if that ever changed, and it stays for that reason.
 func orderForReport(results []*inspection, selfHash string) []*inspection {
 	if selfHash == "" {
 		return results
@@ -258,54 +302,78 @@ func orderForReport(results []*inspection, selfHash string) []*inspection {
 	return append(ordered, self...)
 }
 
-// writeTableOfContents prints one short paragraph naming the files about to
-// be examined, in the order their reports follow, each with its
-// self-reported product name and version if it has them. It is a table of
-// contents, not a summary of findings - every file listed here still gets
-// its own full report below.
+// writeTableOfContents prints one short paragraph naming the files that get
+// a report, in the order those reports follow, each with what it declares
+// about itself. It is a table of contents, not a summary of findings - every
+// file listed here still gets its own full report below.
 func writeTableOfContents(out io.Writer, results []*inspection) {
 	parts := make([]string, 0, len(results))
 	for _, r := range results {
-		parts = append(parts, fmt.Sprintf("%q (%s)", filepath.Clean(r.ImagePath), identityParenthetical(r.Identity)))
+		parts = append(parts, fmt.Sprintf("%q (%s)", filepath.Clean(r.ImagePath), tocParenthetical(r)))
 	}
-	fmt.Fprintf(out, "This directory has %d Windows PE file(s) to examine; their reports follow in this order: %s.\n", len(results), joinProse(parts))
+	fmt.Fprintf(out, "This directory has %d file(s) carrying a %s export; their reports follow in this order: %s.\n", len(results), manifestSymbolName, joinProse(parts))
 }
 
-// identityParenthetical renders a file's self-reported product name and
-// version for the table of contents, degrading gracefully when either or
-// both are absent.
-func identityParenthetical(id identity) string {
+// tocParenthetical renders what a pet declares about itself for the table of
+// contents. It reads from the manifest, not from VERSIONINFO: the manifest
+// is the declaration that put the file in this list.
+func tocParenthetical(r *inspection) string {
+	m := r.Manifest.Manifest
+	if m == nil {
+		return fmt.Sprintf("carries a %s export whose contents could not be read as a v1 manifest", manifestSymbolName)
+	}
+	return fmt.Sprintf("declares itself %q, version %s", declaredOr(m.Has("name"), m.Name), declaredOr(m.Has("version"), m.Version))
+}
+
+// writeClosingParagraph reports, in prose, everything in the scanned
+// directory that has no report above and why - the files examined and found
+// not to declare themselves as pets included. No file is silently left out
+// of the account, per the same "report what could not be examined" rule a
+// single report follows for its own blind spots.
+//
+// Reasons are grouped rather than repeated per file because a directory of
+// twenty non-pets otherwise prints the same clause twenty times, which reads
+// as noise and hides the one file whose reason is different.
+func writeClosingParagraph(out io.Writer, reported int, skipped []skippedFile) {
 	switch {
-	case id.ProductName != "" && id.Version != "":
-		return fmt.Sprintf("self-reports %q %s", id.ProductName, id.Version)
-	case id.ProductName != "":
-		return fmt.Sprintf("self-reports %q, no self-reported version", id.ProductName)
-	case id.Version != "":
-		return fmt.Sprintf("self-reports version %s, no self-reported product name", id.Version)
+	case reported == 0 && len(skipped) == 0:
+		fmt.Fprintln(out, "The current directory has no regular files to account for.")
+		return
+	case reported == 0:
+		fmt.Fprintf(out, "No file in the current directory carries a %s export, so there is no report above. That is not a statement about what these files do; it only means none of them declares itself to be a pet.\n", manifestSymbolName)
+	case len(skipped) == 0:
+		fmt.Fprintln(out, "Every regular file in the current directory declared itself and is reported above.")
+		return
 	default:
-		return "no self-reported identity"
+		fmt.Fprintln(out, "The following file(s) were present in the current directory and have no report above.")
+	}
+	byReason := make(map[string][]string)
+	for _, s := range skipped {
+		byReason[s.Reason] = append(byReason[s.Reason], s.Name)
+	}
+	reasons := make([]string, 0, len(byReason))
+	for reason := range byReason {
+		reasons = append(reasons, reason)
+	}
+	sort.Strings(reasons)
+	for _, reason := range reasons {
+		names := byReason[reason]
+		sort.Slice(names, func(i, j int) bool { return strings.ToLower(names[i]) < strings.ToLower(names[j]) })
+		quoted := make([]string, 0, len(names))
+		for _, name := range names {
+			quoted = append(quoted, fmt.Sprintf("%q", name))
+		}
+		fmt.Fprintf(out, "%s: %s.\n", capitalizeFirst(reason), joinProse(quoted))
 	}
 }
 
-// writeClosingParagraph reports, in prose, what was present in the scanned
-// directory but not examined - no file is silently left out of the account,
-// per the same "report what could not be examined" rule a single report
-// follows for its own blind spots.
-func writeClosingParagraph(out io.Writer, examined int, skipped []skippedFile) {
-	if examined == 0 {
-		fmt.Fprintln(out, "No Windows PE files were found in the current directory.")
-		return
+// capitalizeFirst uppercases the first rune of a sentence fragment so it can
+// start one.
+func capitalizeFirst(value string) string {
+	for i, r := range value {
+		return string(unicode.ToUpper(r)) + value[i+utf8.RuneLen(r):]
 	}
-	if len(skipped) == 0 {
-		fmt.Fprintln(out, "Every regular file in the current directory was examined above.")
-		return
-	}
-	sort.Slice(skipped, func(i, j int) bool { return strings.ToLower(skipped[i].Name) < strings.ToLower(skipped[j].Name) })
-	parts := make([]string, 0, len(skipped))
-	for _, s := range skipped {
-		parts = append(parts, fmt.Sprintf("%q (%s)", s.Name, s.Reason))
-	}
-	fmt.Fprintf(out, "The following file(s) were present in the current directory but not examined because they are not Windows PE images or could not be opened: %s.\n", joinProse(parts))
+	return value
 }
 
 func inspectPE(raw []byte, path string) (*inspection, error) {
@@ -321,6 +389,7 @@ func inspectPE(raw []byte, path string) (*inspection, error) {
 	r := &inspection{File: f, Raw: raw, SHA256: hex.EncodeToString(hash[:]), ImagePath: path, Mapping: table}
 	r.Imports, r.ImportReadErr = readImports(f)
 	r.Identity = readVersionInfo(raw, f)
+	r.Manifest = observeManifest(raw, f)
 	r.TLSCallbacks, r.TLSReadErr = readTLSCallbacks(raw, f)
 	r.HighEntropy, r.UnusualSections = observeSections(raw, f)
 	return r, nil
@@ -360,9 +429,7 @@ func readImports(f *pe.File) ([]importSymbol, error) {
 }
 
 func writeReport(out io.Writer, r *inspection, selfHash string) {
-	fmt.Fprintf(out, "Pet Passport %s read %q. This is a static reading of that one file, not a judgment about it.\n\n", reportedVersion(), filepath.Clean(r.ImagePath))
-	fmt.Fprintln(out, "Identity (self-reported, unverified)")
-	writeIdentity(out, r, selfHash)
+	writeIdentityBlock(out, r, selfHash)
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "Described mechanisms")
 	writeDescribedMechanisms(out, r)
@@ -377,31 +444,193 @@ func writeReport(out io.Writer, r *inspection, selfHash string) {
 	writeAppendix(out, r)
 }
 
-// writeIdentity prints the file's self-reported identity - name, version,
-// company, one sentence per line - followed by its size and SHA-256, and
-// finally, only when the file is byte-identical to the passport that
-// produced this report, one sentence saying so.
-func writeIdentity(out io.Writer, r *inspection, selfHash string) {
-	id := r.Identity
-	if id.ProductName == "" {
-		fmt.Fprintln(out, "No self-reported product name was found in a VERSIONINFO resource.")
+// writeIdentityBlock opens a report with which passport produced it and what
+// the file says it is: a short labelled list, then the sentences that say
+// what those labels are worth. The list is the one place in this report that
+// is not prose, and that is a deliberate exception rather than a direction of
+// travel - it is a handful of fields a reader wants to find at a glance, and
+// none of them is an observation about behavior.
+//
+// Nothing in the list is verified, and the caveat under it says so in the
+// same breath. Whether a name and publisher are true is a question about a
+// checksum and a signature, which this tool does not answer.
+func writeIdentityBlock(out io.Writer, r *inspection, selfHash string) {
+	fmt.Fprintf(out, "Pet Passport %s\n\n", reportedVersion())
+	m := r.Manifest.Manifest
+	if m != nil {
+		writeManifestIdentityList(out, r, m)
 	} else {
-		fmt.Fprintf(out, "The self-reported product name is %q; it is unverified.\n", id.ProductName)
+		writeVersionInfoIdentityList(out, r)
 	}
-	if id.Version == "" {
-		fmt.Fprintln(out, "No self-reported product version was found in a VERSIONINFO resource.")
+	fmt.Fprintln(out)
+	if m != nil {
+		fmt.Fprintln(out, "Name, version, publisher and build are what the file declares about itself; nothing here verifies them.")
+		writeManifestDisagreements(out, r.Identity, m)
+		if m.Has("homepage") && m.Homepage != "" {
+			fmt.Fprintf(out, "The manifest also declares a homepage of %q, which was not visited.\n", oneLine(m.Homepage))
+		}
+		if len(m.Extra) > 0 {
+			fmt.Fprintf(out, "The manifest declares %s, which schema v1 does not define; they were not read.\n", joinProse(quoteAll(m.Extra)))
+		}
+		if len(m.Missing) > 0 {
+			fmt.Fprintf(out, "The manifest does not declare %s, which schema v1 does define.\n", joinProse(quoteAll(m.Missing)))
+		}
 	} else {
-		fmt.Fprintf(out, "The self-reported product version is %q; it is unverified.\n", id.Version)
+		switch {
+		case r.Manifest.Found:
+			fmt.Fprintf(out, "A %s export exists but its contents could not be read as a v1 manifest: %v. This file declares itself a pet; what it declares about itself could not be recovered.\n", manifestSymbolName, r.Manifest.ReadErr)
+		case r.Manifest.ExportErr != nil:
+			fmt.Fprintf(out, "No %s export was read, because this file's export directory could not be read completely: %v. Whether it carries one is unknown rather than settled.\n", manifestSymbolName, r.Manifest.ExportErr)
+		default:
+			fmt.Fprintf(out, "No %s export was found in this file, so nothing in it declares it to be a pet.\n", manifestSymbolName)
+		}
+		fmt.Fprintln(out, "Product, version and publisher above are what the file's VERSIONINFO resource declares about itself; nothing here verifies them.")
 	}
-	if id.Company == "" {
-		fmt.Fprintln(out, "No self-reported company was found in a VERSIONINFO resource.")
-	} else {
-		fmt.Fprintf(out, "The self-reported company is %q; it is unverified.\n", id.Company)
-	}
-	fmt.Fprintf(out, "The file is %d bytes and its SHA-256 is %s.\n", len(r.Raw), r.SHA256)
 	if selfHash != "" && r.SHA256 == selfHash {
 		fmt.Fprintln(out, "This file is the copy of Pet Passport that produced this report.")
 	}
+}
+
+// writeManifestIdentityList prints the labelled list for a file that carries
+// a readable manifest. The slug follows the name in parentheses when the two
+// differ, because the slug is the identifier other things key on and a
+// display name can be anything at all.
+func writeManifestIdentityList(out io.Writer, r *inspection, m *petManifest) {
+	pet := declaredOr(m.Has("name"), m.Name)
+	if m.Slug != "" && m.Slug != m.Name {
+		pet += " (" + oneLine(m.Slug) + ")"
+	}
+	fmt.Fprintf(out, "* Pet: %s\n", pet)
+	fmt.Fprintf(out, "* Version: %s\n", declaredOr(m.Has("version"), m.Version))
+	fmt.Fprintf(out, "* Publisher: %s\n", declaredOr(m.Has("publisher"), m.Publisher))
+	fmt.Fprintf(out, "* Build ID: %s\n", declaredOr(m.Has("build"), m.Build))
+	fmt.Fprintf(out, "* File: %s\n", fileLine(r))
+}
+
+// writeVersionInfoIdentityList prints the labelled list for a file with no
+// readable manifest, filled from the VERSIONINFO resource instead. The first
+// label becomes "Product" because that is the field's actual name there and
+// nothing here has declared itself a pet, and there is no Build ID line at
+// all: VERSIONINFO has no such field, so a "(not declared)" against it would
+// invent an omission rather than report one.
+func writeVersionInfoIdentityList(out io.Writer, r *inspection) {
+	fmt.Fprintf(out, "* Product: %s\n", orNotDeclared(r.Identity.ProductName))
+	fmt.Fprintf(out, "* Version: %s\n", orNotDeclared(r.Identity.Version))
+	fmt.Fprintf(out, "* Publisher: %s\n", orNotDeclared(r.Identity.Company))
+	fmt.Fprintf(out, "* File: %s\n", fileLine(r))
+}
+
+// writeManifestDisagreements names each field where a file's two accounts of
+// itself do not match. Both are self-reported, so neither wins; the
+// disagreement is itself the observation, and one sentence per field keeps
+// which field disagreed specific.
+func writeManifestDisagreements(out io.Writer, id identity, m *petManifest) {
+	pairs := []struct{ field, versionInfo, manifest string }{
+		{"the product name", id.ProductName, m.Name},
+		{"the product version", id.Version, m.Version},
+		{"the company", id.Company, m.Publisher},
+	}
+	for _, pair := range pairs {
+		if pair.versionInfo == "" || pair.manifest == "" || pair.versionInfo == pair.manifest {
+			continue
+		}
+		fmt.Fprintf(out, "The VERSIONINFO resource says %s is %q while the manifest says %q.\n", pair.field, oneLine(pair.versionInfo), oneLine(pair.manifest))
+	}
+}
+
+// fileLine renders the "File" entry: the base name, the size with thousands
+// separators because a nine-digit byte count is unreadable without them, and
+// the whole SHA-256 rather than a prefix, since a truncated digest is not
+// something anyone can check a download against.
+func fileLine(r *inspection) string {
+	return fmt.Sprintf("%s (%s bytes, sha256:%s)", filepath.Base(filepath.Clean(r.ImagePath)), withThousands(len(r.Raw)), r.SHA256)
+}
+
+// declaredOr renders a manifest value, distinguishing a key that was absent
+// from one declared as an empty string. They are different claims and a
+// report that flattens them into one has lost a fact.
+func declaredOr(present bool, value string) string {
+	switch {
+	case !present:
+		return "(not declared)"
+	case value == "":
+		return "(declared empty)"
+	default:
+		return oneLine(value)
+	}
+}
+
+// orNotDeclared renders a VERSIONINFO value, which has no such distinction:
+// an absent field and an empty one are indistinguishable there.
+func orNotDeclared(value string) string {
+	if value == "" {
+		return "(not declared)"
+	}
+	return oneLine(value)
+}
+
+func quoteAll(values []string) []string {
+	quoted := make([]string, 0, len(values))
+	for _, value := range values {
+		quoted = append(quoted, fmt.Sprintf("%q", value))
+	}
+	return quoted
+}
+
+// maxDeclaredRunes caps how much of one declared value a report prints.
+const maxDeclaredRunes = 200
+
+// oneLine renders a string a file declared about itself so that the file
+// cannot forge the shape of the report describing it. Everything in a
+// manifest or a VERSIONINFO resource is attacker-controlled: a newline in a
+// declared name would otherwise let a file print its own "* Publisher:"
+// line, or a whole convincing extra section. Control characters are escaped
+// and an over-long value is truncated, both visibly.
+func oneLine(value string) string {
+	runes := []rune(value)
+	truncated := false
+	if len(runes) > maxDeclaredRunes {
+		runes, truncated = runes[:maxDeclaredRunes], true
+	}
+	var b strings.Builder
+	for _, r := range runes {
+		switch {
+		case r == '\n':
+			b.WriteString(`\n`)
+		case r == '\r':
+			b.WriteString(`\r`)
+		case r == '\t':
+			b.WriteString(`\t`)
+		case r < 0x20 || r == 0x7f:
+			fmt.Fprintf(&b, `\x%02x`, r)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	if truncated {
+		b.WriteString(" [truncated by Pet Passport]")
+	}
+	return b.String()
+}
+
+// withThousands groups a byte count in threes.
+func withThousands(value int) string {
+	digits := strconv.Itoa(value)
+	negative := strings.HasPrefix(digits, "-")
+	if negative {
+		digits = digits[1:]
+	}
+	var b strings.Builder
+	if negative {
+		b.WriteByte('-')
+	}
+	for i := 0; i < len(digits); i++ {
+		if i > 0 && (len(digits)-i)%3 == 0 {
+			b.WriteByte(',')
+		}
+		b.WriteByte(digits[i])
+	}
+	return b.String()
 }
 
 // writeDescribedMechanisms prints one sentence for each observed import
