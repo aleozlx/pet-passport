@@ -54,10 +54,13 @@ pet-passport C:\path\to\some-pet.exe
 ```
 
 Run it with no arguments and it examines every Windows PE file it finds directly in the
-current directory instead (not recursive), printing each file's report in turn, separated by
-a delimiter line, followed by a closing paragraph naming anything present that was not a PE
-image and so was not examined. No file is special-cased, including the passport binary
-itself if it happens to be sitting in that directory.
+current directory instead (not recursive). It first prints a short paragraph naming the files
+it is about to examine, in order, each with its self-reported product name and version if it
+has one, then each file's full report in turn, separated by a delimiter line, followed by a
+closing paragraph naming anything present that was not a PE image and so was not examined.
+Every file gets the same full report; the one exception is ordering, not content: a file
+whose SHA-256 happens to match the running passport's own is moved to the end, since a report
+about the tool checking itself is the least interesting one to the person who ran it.
 
 Double-clicking the exe in Explorer opens a console that closes the instant the program
 exits, so on Windows Pet Passport always prints `Press Enter to close.` and waits before
@@ -71,10 +74,13 @@ Here is a short excerpt from running the tool against `C:\Windows\System32\notep
 Pet Passport <version> read "C:\\Windows\\System32\\notepad.exe". This is a static reading of
 that one file, not a judgment about it.
 
-Self-reported identity (unverified)
-The file is 360448 bytes and its SHA-256 is 468ffe129c395abf6b21a09efdf261910a95fb98aa982e...
+Identity (self-reported, unverified)
 The self-reported product name is "Microsoft® Windows® Operating System"; it is unverified.
-...
+The self-reported product version is "10.0.26100.9278"; it is unverified.
+The self-reported company is "Microsoft Corporation"; it is unverified.
+The file is 360448 bytes and its SHA-256 is 468ffe129c395abf6b21a09efdf261910a95fb98aa982e...
+
+Described mechanisms
 api-ms-win-core-file-l1-1-0.dll imports DeleteFileW. Deletes a file (DeleteFileW).
 USER32.dll imports GetDC. Obtains a device context for a window or the screen (GetDC).
 ...
@@ -82,7 +88,18 @@ USER32.dll imports GetDC. Obtains a device context for a window or the screen (G
 Blind spots in this static reading
 No TLS callbacks were found in the TLS directory; this does not rule out code running
 before ordinary application behavior by other mechanisms.
+...
+
+Appendix: every imported symbol, by DLL
+These are all of the imported symbols this static reading observed, grouped by the DLL that
+exports them. This tool has not assigned most of them a more specific description above; a
+name appearing here only means it was imported, not that it was examined.
+...
 ```
+
+Identity, then the mechanisms the mapping table can name, come first; the full symbol-by-DLL
+inventory - hundreds of names on a real GUI application - is an appendix at the end, so it
+doesn't bury the few sentences that say something specific.
 
 ### Status
 
