@@ -4,6 +4,10 @@ on:
   push:
     tags:
       - 'v*'
+  # One button, from main: builds the current commit as a rolling "dev" prerelease.
+  # The version string is dev-<short sha>, so a dev build's report can never be
+  # mistaken for a release in someone's screenshot.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -26,9 +30,29 @@ jobs:
         id: goversion
         run: echo "version=$(go version)" >> "$GITHUB_OUTPUT"
 
+      - name: Decide version and tag
+        id: meta
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=dev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            echo "tag=dev" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Replace the previous dev prerelease
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete dev --cleanup-tag --yes || true
+
       - name: Build release binaries
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ steps.meta.outputs.version }}
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -51,6 +75,10 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3.0.3
         with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ steps.meta.outputs.prerelease }}
+          name: ${{ steps.meta.outputs.version }}
           files: dist/*
           body: |
             Built with `${{ steps.goversion.outputs.version }}`. Anyone rebuilding this
@@ -58,7 +86,7 @@ jobs:
             byte-identical binaries:
 
             ```
-            CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.passportVersion=${{ github.ref_name }}"
+            CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.passportVersion=${{ steps.meta.outputs.version }}"
             ```
 
             Verify a downloaded binary against `SHA256SUMS` before running it:
