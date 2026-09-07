@@ -2,6 +2,10 @@ package main
 
 import (
 	"encoding/binary"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 )
 
@@ -112,6 +116,93 @@ func TestInspectPENonPEDoesNotPanic(t *testing.T) {
 	}()
 	if _, err := inspectPE([]byte("not a PE"), "not-a-pe.bin"); err == nil {
 		t.Fatal("inspectPE accepted non-PE input")
+	}
+}
+
+func TestClassifyRegularFile(t *testing.T) {
+	dir := t.TempDir()
+	writeFixtureFile(t, dir, "pet.exe", []byte("MZ\x90\x00rest of a PE-shaped header"))
+	writeFixtureFile(t, dir, "notes.txt", []byte("just some notes, not a binary"))
+	writeFixtureFile(t, dir, "empty.bin", nil)
+
+	tests := []struct {
+		name       string
+		file       string
+		wantPE     bool
+		wantReason string // substring expected in the skip reason; ignored when wantPE
+	}{
+		{name: "MZ header selects the file", file: "pet.exe", wantPE: true},
+		{name: "no MZ header is skipped as not a PE image", file: "notes.txt", wantReason: "not a Windows PE image"},
+		{name: "a file too short to have a header is skipped as not a PE image", file: "empty.bin", wantReason: "not a Windows PE image"},
+		{name: "a name that cannot be opened is skipped with the read error", file: "does-not-exist.exe", wantReason: "could not be opened"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			candidate, skip := classifyRegularFile(dir, tt.file)
+			if tt.wantPE {
+				if skip != nil {
+					t.Fatalf("classifyRegularFile(%q) skipped it (%q), want it selected", tt.file, skip.Reason)
+				}
+				if candidate == nil || candidate.Name != tt.file {
+					t.Fatalf("classifyRegularFile(%q) candidate = %#v, want a candidate named %q", tt.file, candidate, tt.file)
+				}
+				return
+			}
+			if candidate != nil {
+				t.Fatalf("classifyRegularFile(%q) returned a candidate, want it skipped", tt.file)
+			}
+			if skip == nil || !strings.Contains(skip.Reason, tt.wantReason) {
+				t.Fatalf("classifyRegularFile(%q) skip = %#v, want a reason containing %q", tt.file, skip, tt.wantReason)
+			}
+		})
+	}
+}
+
+func TestScanDirectorySeparatesPEFromNonPEAndIgnoresSubdirectories(t *testing.T) {
+	dir := t.TempDir()
+	writeFixtureFile(t, dir, "a-pet.exe", []byte("MZ\x90\x00rest of a PE-shaped header"))
+	writeFixtureFile(t, dir, "z-pet.exe", []byte("MZ\x90\x00another PE-shaped header"))
+	writeFixtureFile(t, dir, "readme.txt", []byte("not a binary"))
+	if err := os.Mkdir(filepath.Join(dir, "subdir"), 0o755); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	writeFixtureFile(t, filepath.Join(dir, "subdir"), "nested.exe", []byte("MZ\x90\x00should not be seen"))
+
+	candidates, skipped, err := scanDirectory(dir)
+	if err != nil {
+		t.Fatalf("scanDirectory returned %v", err)
+	}
+
+	gotNames := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		gotNames = append(gotNames, c.Name)
+	}
+	sort.Strings(gotNames)
+	if want := []string{"a-pet.exe", "z-pet.exe"}; !equalStrings(gotNames, want) {
+		t.Fatalf("candidate names = %v, want %v (subdir contents must not appear - the scan is not recursive)", gotNames, want)
+	}
+
+	if len(skipped) != 1 || skipped[0].Name != "readme.txt" {
+		t.Fatalf("skipped = %#v, want just readme.txt", skipped)
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func writeFixtureFile(t *testing.T, dir, name string, content []byte) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), content, 0o644); err != nil {
+		t.Fatalf("WriteFile(%q): %v", name, err)
 	}
 }
 
