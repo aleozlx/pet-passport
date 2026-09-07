@@ -60,10 +60,9 @@ image and so was not examined. No file is special-cased, including the passport 
 itself if it happens to be sitting in that directory.
 
 Double-clicking the exe in Explorer opens a console that closes the instant the program
-exits, so a report you'd otherwise never get to read: when Pet Passport detects it is the
-only process attached to that console, it prints `Press Enter to close.` and waits before
-exiting. Running it from an existing shell is unaffected — it exits immediately, as any CLI
-should.
+exits, so on Windows Pet Passport always prints `Press Enter to close.` and waits before
+exiting when its output is going to a console. Redirect the output to a file and it exits
+immediately.
 
 A report is prose, not a table, and its exact wording is free to change between releases.
 Here is a short excerpt from running the tool against `C:\Windows\System32\notepad.exe`:
