@@ -65,6 +65,7 @@ type sectionObservation struct {
 type inspection struct {
 	File            *pe.File
 	Raw             []byte
+	SHA256          string
 	Identity        identity
 	Imports         []importSymbol
 	ImportReadErr   error
@@ -91,18 +92,38 @@ func main() {
 
 func run() int {
 	defer maybePause()
+	selfHash := runningExecutableSHA256()
 	switch len(os.Args) {
 	case 1:
-		return runDirectoryScan(os.Stdout, ".")
+		return runDirectoryScan(os.Stdout, ".", selfHash)
 	case 2:
-		return runSingleFile(os.Stdout, os.Args[1])
+		return runSingleFile(os.Stdout, os.Args[1], selfHash)
 	default:
 		fmt.Fprintln(os.Stderr, usageText)
 		return 2
 	}
 }
 
-func runSingleFile(out io.Writer, path string) int {
+// runningExecutableSHA256 returns the SHA-256 of the file backing the
+// currently running process, hex-encoded, or "" if it could not be
+// determined (for instance, the executable has since been removed from
+// disk, or the platform does not support locating it). Failing to determine
+// it only means a report omits the "this is the copy that produced this
+// report" sentence; it is not an error for the report as a whole.
+func runningExecutableSHA256() string {
+	path, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
+func runSingleFile(out io.Writer, path string, selfHash string) int {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Pet Passport could not read %q: %v\n", path, err)
@@ -113,7 +134,7 @@ func runSingleFile(out io.Writer, path string) int {
 		fmt.Fprintf(os.Stderr, "%q is not a PE file; Pet Passport examines Windows PE files only.\n", path)
 		return 1
 	}
-	writeReport(out, result)
+	writeReport(out, result, selfHash)
 	return 0
 }
 
@@ -186,25 +207,84 @@ func writeDelimiter(out io.Writer) {
 	fmt.Fprintln(out)
 }
 
-func runDirectoryScan(out io.Writer, dir string) int {
+func runDirectoryScan(out io.Writer, dir string, selfHash string) int {
 	candidates, skipped, err := scanDirectory(dir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Pet Passport could not list %q: %v\n", dir, err)
 		return 1
 	}
-	examined := 0
+	var results []*inspection
 	for _, c := range candidates {
 		result, err := inspectPE(c.Raw, c.Name)
 		if err != nil {
 			skipped = append(skipped, skippedFile{Name: c.Name, Reason: fmt.Sprintf("has an MZ header but could not be read as a Windows PE image: %v", err)})
 			continue
 		}
-		writeReport(out, result)
-		writeDelimiter(out)
-		examined++
+		results = append(results, result)
 	}
-	writeClosingParagraph(out, examined, skipped)
+	results = orderForReport(results, selfHash)
+	if len(results) > 0 {
+		writeTableOfContents(out, results)
+		fmt.Fprintln(out)
+	}
+	for _, result := range results {
+		writeReport(out, result, selfHash)
+		writeDelimiter(out)
+	}
+	writeClosingParagraph(out, len(results), skipped)
 	return 0
+}
+
+// orderForReport reorders inspected files so that a file whose SHA-256
+// matches the running passport's own goes last, keeping the relative order
+// of every other file (the name order scanDirectory already produced). It
+// is the least interesting report to the person who ran the tool, since it
+// is a report about the tool itself rather than about a pet; this only
+// changes where it appears, not what its report says. If selfHash is
+// unknown, or no file matches, the order is unchanged.
+func orderForReport(results []*inspection, selfHash string) []*inspection {
+	if selfHash == "" {
+		return results
+	}
+	ordered := make([]*inspection, 0, len(results))
+	var self []*inspection
+	for _, r := range results {
+		if r.SHA256 == selfHash {
+			self = append(self, r)
+		} else {
+			ordered = append(ordered, r)
+		}
+	}
+	return append(ordered, self...)
+}
+
+// writeTableOfContents prints one short paragraph naming the files about to
+// be examined, in the order their reports follow, each with its
+// self-reported product name and version if it has them. It is a table of
+// contents, not a summary of findings - every file listed here still gets
+// its own full report below.
+func writeTableOfContents(out io.Writer, results []*inspection) {
+	parts := make([]string, 0, len(results))
+	for _, r := range results {
+		parts = append(parts, fmt.Sprintf("%q (%s)", filepath.Clean(r.ImagePath), identityParenthetical(r.Identity)))
+	}
+	fmt.Fprintf(out, "This directory has %d Windows PE file(s) to examine; their reports follow in this order: %s.\n", len(results), joinProse(parts))
+}
+
+// identityParenthetical renders a file's self-reported product name and
+// version for the table of contents, degrading gracefully when either or
+// both are absent.
+func identityParenthetical(id identity) string {
+	switch {
+	case id.ProductName != "" && id.Version != "":
+		return fmt.Sprintf("self-reports %q %s", id.ProductName, id.Version)
+	case id.ProductName != "":
+		return fmt.Sprintf("self-reports %q, no self-reported version", id.ProductName)
+	case id.Version != "":
+		return fmt.Sprintf("self-reports version %s, no self-reported product name", id.Version)
+	default:
+		return "no self-reported identity"
+	}
 }
 
 // writeClosingParagraph reports, in prose, what was present in the scanned
@@ -237,7 +317,8 @@ func inspectPE(raw []byte, path string) (*inspection, error) {
 	if err != nil {
 		return nil, err
 	}
-	r := &inspection{File: f, Raw: raw, ImagePath: path, Mapping: table}
+	hash := sha256.Sum256(raw)
+	r := &inspection{File: f, Raw: raw, SHA256: hex.EncodeToString(hash[:]), ImagePath: path, Mapping: table}
 	r.Imports, r.ImportReadErr = readImports(f)
 	r.Identity = readVersionInfo(raw, f)
 	r.TLSCallbacks, r.TLSReadErr = readTLSCallbacks(raw, f)
@@ -278,23 +359,30 @@ func readImports(f *pe.File) ([]importSymbol, error) {
 	return imports, nil
 }
 
-func writeReport(out io.Writer, r *inspection) {
-	hash := sha256.Sum256(r.Raw)
+func writeReport(out io.Writer, r *inspection, selfHash string) {
 	fmt.Fprintf(out, "Pet Passport %s read %q. This is a static reading of that one file, not a judgment about it.\n\n", reportedVersion(), filepath.Clean(r.ImagePath))
-	fmt.Fprintln(out, "Self-reported identity (unverified)")
-	fmt.Fprintf(out, "The file is %d bytes and its SHA-256 is %s.\n", len(r.Raw), hex.EncodeToString(hash[:]))
-	writeIdentity(out, r.Identity)
+	fmt.Fprintln(out, "Identity (self-reported, unverified)")
+	writeIdentity(out, r, selfHash)
 	fmt.Fprintln(out)
-	fmt.Fprintln(out, "Observed imports")
-	writeImports(out, r)
+	fmt.Fprintln(out, "Described mechanisms")
+	writeDescribedMechanisms(out, r)
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "Blind spots in this static reading")
 	writeBlindSpots(out, r)
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "What this tool cannot see")
 	fmt.Fprintln(out, "This is a static reading of one file. It cannot see code produced after launch, decrypted or downloaded content, direct system calls, user-triggered paths, or what the program actually does on a particular machine. Dynamic and behavioral analysis tools, such as a sandbox, system-call monitor, network capture, or debugger, can observe kinds of runtime behavior that this report cannot.")
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "Appendix: every imported symbol, by DLL")
+	writeAppendix(out, r)
 }
-func writeIdentity(out io.Writer, id identity) {
+
+// writeIdentity prints the file's self-reported identity - name, version,
+// company, one sentence per line - followed by its size and SHA-256, and
+// finally, only when the file is byte-identical to the passport that
+// produced this report, one sentence saying so.
+func writeIdentity(out io.Writer, r *inspection, selfHash string) {
+	id := r.Identity
 	if id.ProductName == "" {
 		fmt.Fprintln(out, "No self-reported product name was found in a VERSIONINFO resource.")
 	} else {
@@ -310,8 +398,18 @@ func writeIdentity(out io.Writer, id identity) {
 	} else {
 		fmt.Fprintf(out, "The self-reported company is %q; it is unverified.\n", id.Company)
 	}
+	fmt.Fprintf(out, "The file is %d bytes and its SHA-256 is %s.\n", len(r.Raw), r.SHA256)
+	if selfHash != "" && r.SHA256 == selfHash {
+		fmt.Fprintln(out, "This file is the copy of Pet Passport that produced this report.")
+	}
 }
-func writeImports(out io.Writer, r *inspection) {
+
+// writeDescribedMechanisms prints one sentence for each observed import
+// that has an entry in the published mapping table, in the existing
+// wording. It says nothing about imports without a mapping entry - those
+// are the appendix's job - so a report that mostly imports unmapped symbols
+// no longer buries the few that are described among them.
+func writeDescribedMechanisms(out io.Writer, r *inspection) {
 	if r.ImportReadErr != nil {
 		fmt.Fprintf(out, "The import table could not be read completely: %v. This does not make the static picture complete.\n", r.ImportReadErr)
 		return
@@ -320,6 +418,32 @@ func writeImports(out io.Writer, r *inspection) {
 		fmt.Fprintln(out, "The import table yielded no symbols for this static reading. Silence in an import table is not evidence about runtime behavior.")
 		return
 	}
+	described := 0
+	for _, imp := range r.Imports {
+		if item, ok := evidenceFor(r.Mapping, imp); ok {
+			fmt.Fprintf(out, "%s imports %s. %s\n", imp.DLL, imp.Symbol, item.Wording)
+			described++
+		}
+	}
+	if described == 0 {
+		fmt.Fprintln(out, "None of the observed imports match an entry in the published mapping table. This is not evidence that the file does or does not use any particular mechanism; the appendix below lists everything that was observed.")
+	}
+}
+
+// writeAppendix prints the full import inventory, one paragraph per DLL in
+// name order, symbol names comma-separated, mapped symbols included so the
+// appendix is a complete record on its own rather than requiring the
+// described-mechanisms section above to be read alongside it.
+func writeAppendix(out io.Writer, r *inspection) {
+	if r.ImportReadErr != nil {
+		fmt.Fprintf(out, "The import table could not be read completely: %v. This does not make the static picture complete.\n", r.ImportReadErr)
+		return
+	}
+	if len(r.Imports) == 0 {
+		fmt.Fprintln(out, "The import table yielded no symbols for this static reading. Silence in an import table is not evidence about runtime behavior.")
+		return
+	}
+	fmt.Fprintln(out, "These are all of the imported symbols this static reading observed, grouped by the DLL that exports them. This tool has not assigned most of them a more specific description above; a name appearing here only means it was imported, not that it was examined.")
 	byDLL := make(map[string][]importSymbol)
 	for _, imp := range r.Imports {
 		byDLL[imp.DLL] = append(byDLL[imp.DLL], imp)
@@ -330,17 +454,11 @@ func writeImports(out io.Writer, r *inspection) {
 	}
 	sort.Slice(dlls, func(i, j int) bool { return strings.ToLower(dlls[i]) < strings.ToLower(dlls[j]) })
 	for _, dll := range dlls {
-		unmapped := make([]string, 0)
+		names := make([]string, 0, len(byDLL[dll]))
 		for _, imp := range byDLL[dll] {
-			if item, ok := evidenceFor(r.Mapping, imp); ok {
-				fmt.Fprintf(out, "%s imports %s. %s\n", imp.DLL, imp.Symbol, item.Wording)
-			} else {
-				unmapped = append(unmapped, imp.Symbol)
-			}
+			names = append(names, imp.Symbol)
 		}
-		if len(unmapped) > 0 {
-			fmt.Fprintf(out, "%s also imports symbols not in the published mapping table: %s. They are observed imports; this tool has not assigned them a more specific description.\n", dll, joinProse(unmapped))
-		}
+		fmt.Fprintf(out, "%s: %s.\n", dll, strings.Join(names, ", "))
 	}
 }
 func evidenceFor(table evidenceTable, imp importSymbol) (evidence, bool) {
