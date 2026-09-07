@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -252,6 +254,22 @@ func padFixture4(data []byte) []byte {
 	return data
 }
 
+// fixtureManifest builds the observation a file carrying exactly these
+// manifest keys would produce, through the real payload parser rather than
+// by filling the struct in, so a test asserting on a manifest is asserting
+// on something parseManifest actually accepts.
+func fixtureManifest(fields map[string]any) manifestObservation {
+	payload, err := json.Marshal(fields)
+	if err != nil {
+		panic("fixtureManifest: " + err.Error())
+	}
+	manifest, err := parseManifest(payload)
+	if err != nil {
+		panic("fixtureManifest: " + err.Error())
+	}
+	return manifestObservation{Found: true, Manifest: manifest}
+}
+
 func fixtureInspection(name string, raw []byte, id identity, imports []importSymbol, mapping evidenceTable) *inspection {
 	sum := sha256.Sum256(raw)
 	return &inspection{
@@ -264,23 +282,66 @@ func fixtureInspection(name string, raw []byte, id identity, imports []importSym
 	}
 }
 
-func TestIdentityParenthetical(t *testing.T) {
+func TestTocParenthetical(t *testing.T) {
 	tests := []struct {
-		name string
-		id   identity
-		want string
+		name     string
+		observed manifestObservation
+		want     string
 	}{
-		{"name and version", identity{ProductName: "tapi", Version: "0.1.0"}, `self-reports "tapi" 0.1.0`},
-		{"name only", identity{ProductName: "tapi"}, `self-reports "tapi", no self-reported version`},
-		{"version only", identity{Version: "0.1.0"}, "self-reports version 0.1.0, no self-reported product name"},
-		{"neither", identity{}, "no self-reported identity"},
+		{
+			name:     "readable manifest is quoted from the manifest",
+			observed: fixtureManifest(map[string]any{"schema": 1, "name": "Tapi Lila Esculenta", "version": "0.1.0"}),
+			want:     `declares itself "Tapi Lila Esculenta", version 0.1.0`,
+		},
+		{
+			name:     "a manifest missing keys says so rather than guessing",
+			observed: fixtureManifest(map[string]any{"schema": 1, "name": "Tapi Lila Esculenta"}),
+			want:     `declares itself "Tapi Lila Esculenta", version (not declared)`,
+		},
+		{
+			name:     "an unreadable manifest is still listed",
+			observed: manifestObservation{Found: true, ReadErr: errors.New("the payload is not a JSON object")},
+			want:     "carries a pet_passport_v1 export whose contents could not be read as a v1 manifest",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := identityParenthetical(tt.id); got != tt.want {
-				t.Fatalf("identityParenthetical(%#v) = %q, want %q", tt.id, got, tt.want)
+			r := fixtureInspection("pet.exe", []byte("bytes"), identity{}, nil, evidenceTable{})
+			r.Manifest = tt.observed
+			if got := tocParenthetical(r); got != tt.want {
+				t.Fatalf("tocParenthetical() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestPartitionPetsReportsOnlyDeclaredPets(t *testing.T) {
+	pet := fixtureInspection("pet.exe", []byte("a"), identity{}, nil, evidenceTable{})
+	pet.Manifest = fixtureManifest(map[string]any{"schema": 1, "name": "Pet"})
+	unreadable := fixtureInspection("half-pet.exe", []byte("b"), identity{}, nil, evidenceTable{})
+	unreadable.Manifest = manifestObservation{Found: true, ReadErr: errors.New("the payload is not a JSON object")}
+	plain := fixtureInspection("tool.exe", []byte("c"), identity{}, nil, evidenceTable{})
+	broken := fixtureInspection("broken.exe", []byte("d"), identity{}, nil, evidenceTable{})
+	broken.Manifest = manifestObservation{ExportErr: errors.New("export address table: the range runs past the end of the file")}
+
+	pets, others := partitionPets([]*inspection{pet, unreadable, plain, broken})
+
+	gotPets := make([]string, 0, len(pets))
+	for _, r := range pets {
+		gotPets = append(gotPets, r.ImagePath)
+	}
+	if want := []string{"pet.exe", "half-pet.exe"}; !equalStrings(gotPets, want) {
+		t.Fatalf("reported files = %v, want %v (a file carrying an unreadable manifest still declared itself)", gotPets, want)
+	}
+
+	if len(others) != 2 {
+		t.Fatalf("unreported files = %#v, want two", others)
+	}
+	if others[0].Name != "tool.exe" || others[0].Reason != "examined; not a pet (no pet_passport_v1 export)" {
+		t.Fatalf("unreported[0] = %#v, want tool.exe named as examined and not a pet", others[0])
+	}
+	if others[1].Name != "broken.exe" || !strings.Contains(others[1].Reason, "could not be read completely") {
+		t.Fatalf("unreported[1] = %#v, want broken.exe named with the reason its export directory could not be read", others[1])
 	}
 }
 
@@ -324,7 +385,7 @@ func TestWriteReportSectionOrderAndAppendixCompleteness(t *testing.T) {
 	out := buf.String()
 
 	headings := []string{
-		"Identity (self-reported, unverified)",
+		"* File: fixture.exe",
 		"Described mechanisms",
 		"Blind spots in this static reading",
 		"What this tool cannot see",
@@ -382,19 +443,247 @@ func TestWriteDescribedMechanismsNoneMapped(t *testing.T) {
 	}
 }
 
-func TestWriteTableOfContentsOrdersAndAnnotatesIdentity(t *testing.T) {
-	withIdentity := fixtureInspection("tapi.exe", []byte("a"), identity{ProductName: "tapi", Version: "0.1.0"}, nil, evidenceTable{})
-	withoutIdentity := fixtureInspection("tool.exe", []byte("b"), identity{}, nil, evidenceTable{})
+func TestWriteTableOfContentsOrdersAndAnnotatesDeclarations(t *testing.T) {
+	declared := fixtureInspection("tapi.exe", []byte("a"), identity{}, nil, evidenceTable{})
+	declared.Manifest = fixtureManifest(map[string]any{"schema": 1, "name": "tapi", "version": "0.1.0"})
+	unreadable := fixtureInspection("tool.exe", []byte("b"), identity{}, nil, evidenceTable{})
+	unreadable.Manifest = manifestObservation{Found: true, ReadErr: errors.New("the payload is not a JSON object")}
 
 	var buf bytes.Buffer
-	writeTableOfContents(&buf, []*inspection{withIdentity, withoutIdentity})
+	writeTableOfContents(&buf, []*inspection{declared, unreadable})
 	got := buf.String()
 	for _, want := range []string{
-		`"tapi.exe" (self-reports "tapi" 0.1.0)`,
-		`"tool.exe" (no self-reported identity)`,
+		`This directory has 2 file(s) carrying a pet_passport_v1 export`,
+		`"tapi.exe" (declares itself "tapi", version 0.1.0)`,
+		`"tool.exe" (carries a pet_passport_v1 export whose contents could not be read as a v1 manifest)`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("table of contents = %q, want it to contain %q", got, want)
+		}
+	}
+}
+
+func TestWriteClosingParagraphNamesEveryUnreportedFile(t *testing.T) {
+	tests := []struct {
+		name     string
+		reported int
+		skipped  []skippedFile
+		want     []string
+		notWant  []string
+	}{
+		{
+			name:     "non-pets are named with the same reason grouped once",
+			reported: 1,
+			skipped: []skippedFile{
+				{Name: "notepad.exe", Reason: "examined; not a pet (no pet_passport_v1 export)"},
+				{Name: "pet-passport.exe", Reason: "examined; not a pet (no pet_passport_v1 export)"},
+				{Name: "readme.txt", Reason: "not a Windows PE image"},
+			},
+			want: []string{
+				`Examined; not a pet (no pet_passport_v1 export): "notepad.exe" and "pet-passport.exe".`,
+				`Not a Windows PE image: "readme.txt".`,
+			},
+		},
+		{
+			name:     "a directory with no pets says so without implying anything about the files",
+			reported: 0,
+			skipped:  []skippedFile{{Name: "notepad.exe", Reason: "examined; not a pet (no pet_passport_v1 export)"}},
+			want: []string{
+				"No file in the current directory carries a pet_passport_v1 export",
+				"That is not a statement about what these files do",
+				`Examined; not a pet (no pet_passport_v1 export): "notepad.exe".`,
+			},
+		},
+		{
+			name:     "every file reported leaves nothing to account for",
+			reported: 2,
+			skipped:  nil,
+			want:     []string{"Every regular file in the current directory declared itself and is reported above."},
+			notWant:  []string{"not a pet"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			writeClosingParagraph(&buf, tt.reported, tt.skipped)
+			got := buf.String()
+			for _, want := range tt.want {
+				if !strings.Contains(got, want) {
+					t.Fatalf("closing paragraph = %q, want it to contain %q", got, want)
+				}
+			}
+			for _, notWant := range tt.notWant {
+				if strings.Contains(got, notWant) {
+					t.Fatalf("closing paragraph = %q, want it not to contain %q", got, notWant)
+				}
+			}
+		})
+	}
+}
+
+func TestWriteIdentityBlockFromManifest(t *testing.T) {
+	r := fixtureInspection("tapi-lila.exe", []byte("pet bytes"), identity{}, nil, evidenceTable{})
+	r.Manifest = fixtureManifest(map[string]any{
+		"schema":    1,
+		"name":      "Tapi Lila Esculenta",
+		"slug":      "tapi-lila",
+		"version":   "0.1.0",
+		"build":     "7a9663a",
+		"publisher": "Alex",
+		"homepage":  "https://example.invalid/tapi",
+	})
+
+	var buf bytes.Buffer
+	writeIdentityBlock(&buf, r, "")
+	got := buf.String()
+	for _, want := range []string{
+		"* Pet: Tapi Lila Esculenta (tapi-lila)\n",
+		"* Version: 0.1.0\n",
+		"* Publisher: Alex\n",
+		"* Build ID: 7a9663a\n",
+		"* File: tapi-lila.exe (9 bytes, sha256:" + r.SHA256 + ")\n",
+		"Name, version, publisher and build are what the file declares about itself; nothing here verifies them.",
+		`The manifest also declares a homepage of "https://example.invalid/tapi", which was not visited.`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("identity block = %q, want it to contain %q", got, want)
+		}
+	}
+	if strings.Contains(got, "* Product:") {
+		t.Fatalf("identity block used the VERSIONINFO form for a file with a manifest:\n%s", got)
+	}
+}
+
+func TestWriteIdentityBlockReportsMissingAndExtraKeys(t *testing.T) {
+	r := fixtureInspection("odd.exe", []byte("pet bytes"), identity{}, nil, evidenceTable{})
+	r.Manifest = fixtureManifest(map[string]any{
+		"schema":    1,
+		"name":      "Odd",
+		"slug":      "odd",
+		"version":   "",
+		"publisher": "Someone",
+		"telemetry": "yes please",
+	})
+
+	var buf bytes.Buffer
+	writeIdentityBlock(&buf, r, "")
+	got := buf.String()
+	for _, want := range []string{
+		"* Version: (declared empty)\n",
+		"* Build ID: (not declared)\n",
+		`The manifest declares "telemetry", which schema v1 does not define; they were not read.`,
+		`The manifest does not declare "build" and "homepage", which schema v1 does define.`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("identity block = %q, want it to contain %q", got, want)
+		}
+	}
+}
+
+func TestWriteIdentityBlockWithoutAManifestUsesVersionInfo(t *testing.T) {
+	tests := []struct {
+		name     string
+		observed manifestObservation
+		want     string
+	}{
+		{
+			name:     "no export at all",
+			observed: manifestObservation{},
+			want:     "No pet_passport_v1 export was found in this file, so nothing in it declares it to be a pet.",
+		},
+		{
+			name:     "an export whose payload did not parse",
+			observed: manifestObservation{Found: true, ReadErr: errors.New("the payload is not a JSON object")},
+			want:     "A pet_passport_v1 export exists but its contents could not be read as a v1 manifest",
+		},
+		{
+			name:     "an export directory that could not be read",
+			observed: manifestObservation{ExportErr: errors.New("export address table: the range runs past the end of the file")},
+			want:     "Whether it carries one is unknown rather than settled.",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := fixtureInspection("notepad.exe", make([]byte, 360448), identity{ProductName: "Some Product", Version: "10.0.1", Company: "Some Company"}, nil, evidenceTable{})
+			r.Manifest = tt.observed
+
+			var buf bytes.Buffer
+			writeIdentityBlock(&buf, r, "")
+			got := buf.String()
+			for _, want := range []string{
+				"* Product: Some Product\n",
+				"* Version: 10.0.1\n",
+				"* Publisher: Some Company\n",
+				"* File: notepad.exe (360,448 bytes, sha256:",
+				"Product, version and publisher above are what the file's VERSIONINFO resource declares about itself; nothing here verifies them.",
+				tt.want,
+			} {
+				if !strings.Contains(got, want) {
+					t.Fatalf("identity block = %q, want it to contain %q", got, want)
+				}
+			}
+			if strings.Contains(got, "* Pet:") || strings.Contains(got, "* Build ID:") {
+				t.Fatalf("identity block claimed manifest fields for a file with no readable manifest:\n%s", got)
+			}
+		})
+	}
+}
+
+func TestWriteIdentityBlockNamesDisagreementsBetweenTheTwoDeclarations(t *testing.T) {
+	r := fixtureInspection("pet.exe", []byte("pet bytes"), identity{ProductName: "Something Else", Version: "0.1.0", Company: "Another Publisher"}, nil, evidenceTable{})
+	r.Manifest = fixtureManifest(map[string]any{
+		"schema": 1, "name": "Tapi Lila Esculenta", "slug": "tapi-lila",
+		"version": "0.1.0", "build": "7a9663a", "publisher": "Alex", "homepage": "",
+	})
+
+	var buf bytes.Buffer
+	writeIdentityBlock(&buf, r, "")
+	got := buf.String()
+	if want := `The VERSIONINFO resource says the product name is "Something Else" while the manifest says "Tapi Lila Esculenta".`; !strings.Contains(got, want) {
+		t.Fatalf("identity block = %q, want it to contain %q", got, want)
+	}
+	if want := `The VERSIONINFO resource says the company is "Another Publisher" while the manifest says "Alex".`; !strings.Contains(got, want) {
+		t.Fatalf("identity block = %q, want it to contain %q", got, want)
+	}
+	if strings.Contains(got, "the product version is") {
+		t.Fatalf("identity block named a field the two declarations agree on:\n%s", got)
+	}
+}
+
+// A declared string is attacker-controlled input that ends up in the report,
+// so it must not be able to forge the report's own shape.
+func TestWriteIdentityBlockEscapesDeclaredValues(t *testing.T) {
+	r := fixtureInspection("pet.exe", []byte("pet bytes"), identity{}, nil, evidenceTable{})
+	r.Manifest = fixtureManifest(map[string]any{
+		"schema": 1,
+		"name":   "Innocent\n* Publisher: Microsoft Corporation\n",
+		"slug":   strings.Repeat("x", 400),
+	})
+
+	var buf bytes.Buffer
+	writeIdentityBlock(&buf, r, "")
+	got := buf.String()
+	if strings.Contains(got, "\n* Publisher: Microsoft Corporation") {
+		t.Fatalf("a declared name forged a report line:\n%s", got)
+	}
+	if !strings.Contains(got, `Innocent\n* Publisher: Microsoft Corporation\n`) {
+		t.Fatalf("identity block did not escape the newlines in a declared name:\n%s", got)
+	}
+	if !strings.Contains(got, "[truncated by Pet Passport]") {
+		t.Fatalf("identity block did not truncate an over-long declared value:\n%s", got)
+	}
+}
+
+func TestWithThousands(t *testing.T) {
+	tests := []struct {
+		value int
+		want  string
+	}{
+		{0, "0"}, {7, "7"}, {999, "999"}, {1000, "1,000"}, {360448, "360,448"}, {6417408, "6,417,408"},
+	}
+	for _, tt := range tests {
+		if got := withThousands(tt.value); got != tt.want {
+			t.Fatalf("withThousands(%d) = %q, want %q", tt.value, got, tt.want)
 		}
 	}
 }
