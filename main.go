@@ -13,11 +13,32 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strings"
 )
 
-const passportVersion = "development"
+// passportVersion is normally set at build time via
+// -ldflags "-X main.passportVersion=<tag>" (see .github/workflows/release.yml).
+// It is a var, not a const, so the linker can overwrite it.
+var passportVersion = "development"
+
+// reportedVersion returns the version to print in a report. A release binary
+// already has passportVersion set by the linker. A binary built without that
+// flag - notably one installed with "go install .../pet-passport@vX.Y.Z" -
+// still carries its module version in the Go build info, so fall back to that
+// before giving up and reporting "development".
+func reportedVersion() string {
+	if passportVersion != "development" {
+		return passportVersion
+	}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if v := info.Main.Version; v != "" && v != "(devel)" {
+			return v
+		}
+	}
+	return passportVersion
+}
 
 //go:embed mappings/evidence.json
 var evidenceJSON []byte
@@ -124,7 +145,7 @@ func readImports(f *pe.File) ([]importSymbol, error) {
 
 func writeReport(out *os.File, r *inspection) {
 	hash := sha256.Sum256(r.Raw)
-	fmt.Fprintf(out, "Pet Passport %s read %q. This is a static reading of that one file, not a judgment about it.\n\n", passportVersion, filepath.Clean(r.ImagePath))
+	fmt.Fprintf(out, "Pet Passport %s read %q. This is a static reading of that one file, not a judgment about it.\n\n", reportedVersion(), filepath.Clean(r.ImagePath))
 	fmt.Fprintln(out, "Self-reported identity (unverified)")
 	fmt.Fprintf(out, "The file is %d bytes and its SHA-256 is %s.\n", len(r.Raw), hex.EncodeToString(hash[:]))
 	writeIdentity(out, r.Identity)

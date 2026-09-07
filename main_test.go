@@ -77,6 +77,33 @@ func TestParseTLSDirectoryRejectsTruncatedAndUnterminatedData(t *testing.T) {
 	}
 }
 
+func TestReportedVersionUsesLinkedVersionWhenSet(t *testing.T) {
+	original := passportVersion
+	defer func() { passportVersion = original }()
+
+	passportVersion = "v1.2.3"
+	if got := reportedVersion(); got != "v1.2.3" {
+		t.Fatalf("reportedVersion() = %q, want %q", got, "v1.2.3")
+	}
+}
+
+func TestReportedVersionFallsBackWithoutALinkedOrModuleVersion(t *testing.T) {
+	original := passportVersion
+	defer func() { passportVersion = original }()
+
+	// "development" is the unlinked default. Under `go test` there is no
+	// `go install .../pet-passport@vX.Y.Z` module version either, so
+	// debug.ReadBuildInfo reports the placeholder "(devel)" rather than a
+	// real version. reportedVersion must recognize that placeholder as "no
+	// real version available" and fall back to "development", not surface
+	// "(devel)" as if it were one.
+	passportVersion = "development"
+	got := reportedVersion()
+	if got != "development" {
+		t.Fatalf("reportedVersion() = %q, want %q (no real module version available under go test)", got, "development")
+	}
+}
+
 func TestInspectPENonPEDoesNotPanic(t *testing.T) {
 	defer func() {
 		if recovered := recover(); recovered != nil {

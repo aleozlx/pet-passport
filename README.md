@@ -22,10 +22,61 @@ system call monitor, a network capture, or a debugger. This is one instrument, o
 the belief that you should be able to check things yourself. It will tell you where it
 cannot see.
 
+### Get a release binary
+
+Download `pet-passport-<version>-<os>-<arch>` and `SHA256SUMS` from the
+[releases page](https://github.com/aleozlx/pet-passport/releases) for the platform you're on
+(`windows-amd64`, `linux-amd64`, or `darwin-arm64`), then check the binary against the
+published hash before running it:
+
+```
+sha256sum -c SHA256SUMS                              # Linux/macOS
+Get-FileHash pet-passport-<version>-windows-amd64.exe -Algorithm SHA256   # Windows PowerShell, compare against SHA256SUMS
+```
+
+Each release's notes state the exact Go version and build command used, so the build is
+reproducible by anyone.
+
+### Build from source
+
+Requires only the Go toolchain named in [`go.mod`](go.mod) — no other dependencies.
+
+```
+git clone https://github.com/aleozlx/pet-passport
+cd pet-passport
+go build
+```
+
+### Run it
+
+```
+pet-passport C:\path\to\some-pet.exe
+```
+
+A report is prose, not a table, and its exact wording is free to change between releases.
+Here is a short excerpt from running the tool against `C:\Windows\System32\notepad.exe`:
+
+```
+Pet Passport <version> read "C:\\Windows\\System32\\notepad.exe". This is a static reading of
+that one file, not a judgment about it.
+
+Self-reported identity (unverified)
+The file is 360448 bytes and its SHA-256 is 468ffe129c395abf6b21a09efdf261910a95fb98aa982e...
+The self-reported product name is "Microsoft® Windows® Operating System"; it is unverified.
+...
+api-ms-win-core-file-l1-1-0.dll imports DeleteFileW. Deletes a file (DeleteFileW).
+USER32.dll imports GetDC. Obtains a device context for a window or the screen (GetDC).
+...
+
+Blind spots in this static reading
+No TLS callbacks were found in the TLS directory; this does not rule out code running
+before ordinary application behavior by other mechanisms.
+```
+
 ### Status
 
-Early; no implementation yet. [`docs/design.md`](docs/design.md) is the current thinking —
-read it before proposing a feature, particularly the non-goals, which are deliberate
-refusals rather than unfinished work. Contributions: [`CONTRIBUTING.md`](CONTRIBUTING.md).
+[`docs/design.md`](docs/design.md) is the current thinking — read it before proposing a
+feature, particularly the non-goals, which are deliberate refusals rather than unfinished
+work. Contributions: [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 Apache-2.0.
