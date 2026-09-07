@@ -50,6 +50,10 @@ parse — prose rather than aligned columns, phrasing free to change between rel
 do not "tidy" output into something machine-readable, and please do not build tooling that
 depends on its shape; that dependency is exactly what the design is avoiding.
 
+The one exception is the identity block at the top of a report, which is a short labelled list
+by the project owner's decision; everything else is prose, and nothing about that exception
+changes the lack of an output schema or of any stability guarantee.
+
 ## Version independence
 
 Any release must run against any binary, including ones newer than itself. Never add a

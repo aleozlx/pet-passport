@@ -63,6 +63,52 @@ So the report must say what it could not see. "This binary resolves imports at r
 the static picture is partial" is as much an observation about the artifact as any import
 is, and omitting it is the one way a purely descriptive tool can still mislead.
 
+## Self-declared identity: the `pet_passport_v1` export
+
+How a pet declares what it is was an open question in earlier revisions of this document. It
+is settled: **a pet exports one data symbol named `pet_passport_v1` from its PE export
+directory**, and at that symbol's address are NUL-terminated UTF-8 JSON bytes — at most 4096
+including the NUL — carrying a display name, a slug, a version, a build hash, a publisher and
+a homepage. [`README.md`](../README.md) gives the field list and an example, in enough detail
+to implement from; this section is about why, and about what the declaration is worth.
+
+**It is a declaration, not a credential.** Anyone can export those bytes. A file can copy
+another author's manifest verbatim, and this tool would print the copy exactly as it prints
+the original, because it is reporting what the file says about itself and that is all it has
+observed. Nothing in the format is a signature, and adding one here would not help: a checker
+reading a file cannot distinguish a legitimate signature from one the same file also carries.
+
+**Authenticity is a checksum question, and it lives outside this tool.** Whether the file in
+front of you is the file its author published is answered by comparing its SHA-256 against
+what the author published, somewhere you already trust the author to speak from. That is why
+every report prints the whole digest rather than a prefix, and why the manifest's own claims
+sit under a sentence saying nothing here verifies them. The manifest answers "what does this
+file say it is"; the digest is what lets someone else answer "and is it".
+
+**The schema version is in the symbol name.** A future schema is a new symbol name, never a
+change to what `pet_passport_v1` means. This is version independence applied to the format: a
+passport that reads v1 keeps reading v1 forever, an old passport meets a v2 pet and reports a
+file whose declaration it does not read rather than erroring, and no pet is ever retroactively
+made unreadable by a decision taken after it shipped.
+
+**The export directory, rather than a resource or a named section**, because it is the one
+place in the format that already means "here is a name, and here is where the thing with that
+name lives". Reading it needs no heuristics and no scanning: the name is in the table or it is
+not. A VERSIONINFO resource is not a substitute — it exists for installers and file property
+sheets, its fields mean what Windows says they mean, and it has no room for a slug or a build
+hash without overloading a field that something else already reads. The cost is real and worth
+stating: a pet author has to get their toolchain to export a data symbol from an executable,
+which is one line in some toolchains and awkward in others.
+
+**Directory mode reports on pets.** With no arguments, the passport still examines every PE
+file it finds, but a full report is for files carrying this export. A folder holding a pet
+usually also holds a runtime, an installer, an updater and quite possibly a copy of this
+passport, and a full report on each of those buries the one the reader came for. Files
+examined and found not to declare themselves are named in the closing paragraph — not
+silently dropped, because a file examined and left out of the account is exactly the quiet
+this design refuses elsewhere. An explicit path argument still reports whatever it is given,
+pet or not, and says which it was.
+
 ## Version independence
 
 Any passport version is expected to run against any pet, including pets built long before
@@ -109,6 +155,13 @@ unpleasant to depend on: prose and full sentences rather than fixed columns, no 
 fields inviting a split on whitespace, and no reluctance to change phrasing between
 releases.
 
+There is one exception, and it is deliberately a narrow one. A report opens with a short
+labelled list of what the file says it is — name, version, publisher, build, and the file's
+own size and digest. Those are five facts a reader wants to find at a glance and none of them
+is an observation about behavior, which is the part prose is protecting. Nothing else in a
+report is a list, no stability is promised for this one either, and it is not a precedent for
+rendering findings that way.
+
 ## Non-goals
 
 These are refusals, not gaps. Each one is something a well-intentioned contributor will
@@ -149,7 +202,8 @@ declines to hold. **Do not add these silently.**
 - **Platforms.** Windows is the first target. macOS and Linux binaries have their own
   equivalents of everything described here, and none of the design above is
   Windows-specific, but the observation engine will be.
-- **Identity metadata.** A pet may carry self-declared identifying information such as a
-  name and version. This is self-asserted and must be reported as such — "self-reported
-  name" rather than "name" — but the format and location of that declaration are not
-  settled.
+- **Beyond Windows PE.** The manifest above is defined in terms of a PE export directory.
+  The same declaration has an obvious home in a Mach-O or ELF symbol table, but what the
+  symbol is called there, and whether the payload stays byte-identical across the three,
+  is not settled and should be settled alongside the platform question above rather than
+  guessed at now.
