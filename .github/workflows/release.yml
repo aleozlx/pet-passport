@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Record Go version
+        id: goversion
+        run: echo "version=$(go version)" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binaries
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          build() {
+            local goos="$1" goarch="$2" ext="$3"
+            local name="pet-passport-${TAG}-${goos}-${goarch}${ext}"
+            echo "Building ${name}"
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
+              go build -trimpath -ldflags "-s -w -X main.passportVersion=${TAG}" \
+              -o "dist/${name}" .
+          }
+
+          build windows amd64 .exe
+          build linux amd64 ""
+          build darwin arm64 ""
+
+          ( cd dist && sha256sum * > SHA256SUMS )
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3.0.3
+        with:
+          files: dist/*
+          body: |
+            Built with `${{ steps.goversion.outputs.version }}`. Anyone rebuilding this
+            tag with the same Go version and the command below should reproduce
+            byte-identical binaries:
+
+            ```
+            CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.passportVersion=${{ github.ref_name }}"
+            ```
+
+            Verify a downloaded binary against `SHA256SUMS` before running it:
+
+            ```
+            sha256sum -c SHA256SUMS                     # Linux/macOS
+            Get-FileHash <file> -Algorithm SHA256        # Windows PowerShell
+            ```
