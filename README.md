@@ -107,6 +107,12 @@ mapping table can name, come first; the full symbol-by-DLL inventory - hundreds 
 real GUI application - is an appendix at the end, so it doesn't bury the few sentences that
 say something specific.
 
+Imports are read from both the ordinary import table and the delay-load import directory,
+where a linker puts the DLLs it was told to load only when one of their functions is first
+called. Both go through the same mapping table; a delay-loaded one is marked wherever it is
+named, as in `USER32.dll imports (delay-loaded) GetAsyncKeyState.`, so that two reports never
+differ only because of a linker flag without saying so.
+
 ### Declaring a pet: the `pet_passport_v1` manifest
 
 A pet says what it is by exporting one data symbol. Everything a pet author needs is here.

@@ -1,0 +1,4 @@
+# The delay-load fixtures are linker output and must not be touched by line-ending
+# conversion; the script that rebuilds them is a Windows batch file.
+testdata/delayload/*.exe binary
+testdata/delayload/*.cmd text eol=crlf

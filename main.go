@@ -60,25 +60,37 @@ type evidence struct {
 	Wording    string   `json:"wording"`
 }
 type identity struct{ ProductName, Version, Company string }
-type importSymbol struct{ DLL, Symbol string }
+
+// importSymbol is one imported function. Delayed marks one read from the
+// delay-load import directory rather than the ordinary import directory. Both
+// are resolved by name; a delay-loaded one only on its first call, by a helper
+// routine linked into the file rather than by the loader at startup.
+type importSymbol struct {
+	DLL, Symbol string
+	Delayed     bool
+}
 type sectionObservation struct {
 	Name    string
 	Entropy float64
 }
 type inspection struct {
-	File            *pe.File
-	Raw             []byte
-	SHA256          string
-	Identity        identity
-	Manifest        manifestObservation
-	Imports         []importSymbol
-	ImportReadErr   error
-	TLSCallbacks    int
-	TLSReadErr      error
-	HighEntropy     []sectionObservation
-	UnusualSections []string
-	ImagePath       string
-	Mapping         evidenceTable
+	File          *pe.File
+	Raw           []byte
+	SHA256        string
+	Identity      identity
+	Manifest      manifestObservation
+	Imports       []importSymbol
+	ImportReadErr error
+	// DelayImportReadErr and DelayOrdinals describe the delay-load import
+	// directory; its named imports are in Imports, marked Delayed.
+	DelayImportReadErr error
+	DelayOrdinals      map[string]int
+	TLSCallbacks       int
+	TLSReadErr         error
+	HighEntropy        []sectionObservation
+	UnusualSections    []string
+	ImagePath          string
+	Mapping            evidenceTable
 }
 
 const usageText = `Usage: pet-passport [path-to-windows-pe-binary]
@@ -388,6 +400,10 @@ func inspectPE(raw []byte, path string) (*inspection, error) {
 	hash := sha256.Sum256(raw)
 	r := &inspection{File: f, Raw: raw, SHA256: hex.EncodeToString(hash[:]), ImagePath: path, Mapping: table}
 	r.Imports, r.ImportReadErr = readImports(f)
+	delayed := readDelayImports(raw, f)
+	r.Imports = append(r.Imports, delayed.Imports...)
+	r.DelayImportReadErr, r.DelayOrdinals = delayed.Err, delayed.Ordinals
+	sortImports(r.Imports)
 	r.Identity = readVersionInfo(raw, f)
 	r.Manifest = observeManifest(raw, f)
 	r.TLSCallbacks, r.TLSReadErr = readTLSCallbacks(raw, f)
@@ -419,13 +435,51 @@ func readImports(f *pe.File) ([]importSymbol, error) {
 		}
 		imports = append(imports, importSymbol{DLL: value[at+1:], Symbol: value[:at]})
 	}
-	sort.Slice(imports, func(i, j int) bool {
-		if strings.EqualFold(imports[i].DLL, imports[j].DLL) {
-			return strings.ToLower(imports[i].Symbol) < strings.ToLower(imports[j].Symbol)
-		}
-		return strings.ToLower(imports[i].DLL) < strings.ToLower(imports[j].DLL)
-	})
+	sortImports(imports)
 	return imports, nil
+}
+
+// sortImports orders imports by DLL case-insensitively, then by the DLL name
+// exactly as the file spelled it, then ordinary before delay-loaded, then by
+// symbol case-insensitively. The exact-spelling step keeps two spellings of
+// one DLL apart, so the appendix can name each as the file did.
+func sortImports(imports []importSymbol) {
+	sort.SliceStable(imports, func(i, j int) bool {
+		if !strings.EqualFold(imports[i].DLL, imports[j].DLL) {
+			return strings.ToLower(imports[i].DLL) < strings.ToLower(imports[j].DLL)
+		}
+		if imports[i].DLL != imports[j].DLL {
+			return imports[i].DLL < imports[j].DLL
+		}
+		if imports[i].Delayed != imports[j].Delayed {
+			return !imports[i].Delayed
+		}
+		return strings.ToLower(imports[i].Symbol) < strings.ToLower(imports[j].Symbol)
+	})
+}
+
+// delayedMarker is how a report marks a delay-loaded import wherever it names
+// one, so that a reader can always tell which directory it was read from.
+const delayedMarker = " (delay-loaded)"
+
+func delayedSuffix(imp importSymbol) string {
+	if imp.Delayed {
+		return delayedMarker
+	}
+	return ""
+}
+
+// writeImportReadErrors prints one sentence for each import directory that
+// could not be read completely, and reports whether it printed any. A
+// failure in one directory does not hide what the other yielded.
+func writeImportReadErrors(out io.Writer, r *inspection) bool {
+	if r.ImportReadErr != nil {
+		fmt.Fprintf(out, "The import table could not be read completely: %v. This does not make the static picture complete.\n", r.ImportReadErr)
+	}
+	if r.DelayImportReadErr != nil {
+		fmt.Fprintf(out, "The delay-load import directory could not be read completely: %v. Any delay-loaded imports named here are only the ones read before that point.\n", r.DelayImportReadErr)
+	}
+	return r.ImportReadErr != nil || r.DelayImportReadErr != nil
 }
 
 func writeReport(out io.Writer, r *inspection, selfHash string) {
@@ -639,18 +693,17 @@ func withThousands(value int) string {
 // are the appendix's job - so a report that mostly imports unmapped symbols
 // no longer buries the few that are described among them.
 func writeDescribedMechanisms(out io.Writer, r *inspection) {
-	if r.ImportReadErr != nil {
-		fmt.Fprintf(out, "The import table could not be read completely: %v. This does not make the static picture complete.\n", r.ImportReadErr)
+	if writeImportReadErrors(out, r) && len(r.Imports) == 0 {
 		return
 	}
 	if len(r.Imports) == 0 {
-		fmt.Fprintln(out, "The import table yielded no symbols for this static reading. Silence in an import table is not evidence about runtime behavior.")
+		fmt.Fprintln(out, noImportsSentence)
 		return
 	}
 	described := 0
 	for _, imp := range r.Imports {
 		if item, ok := evidenceFor(r.Mapping, imp); ok {
-			fmt.Fprintf(out, "%s imports %s. %s\n", imp.DLL, imp.Symbol, item.Wording)
+			fmt.Fprintf(out, "%s imports%s %s. %s\n", imp.DLL, delayedSuffix(imp), imp.Symbol, item.Wording)
 			described++
 		}
 	}
@@ -664,31 +717,46 @@ func writeDescribedMechanisms(out io.Writer, r *inspection) {
 // appendix is a complete record on its own rather than requiring the
 // described-mechanisms section above to be read alongside it.
 func writeAppendix(out io.Writer, r *inspection) {
-	if r.ImportReadErr != nil {
-		fmt.Fprintf(out, "The import table could not be read completely: %v. This does not make the static picture complete.\n", r.ImportReadErr)
+	if writeImportReadErrors(out, r) && len(r.Imports) == 0 {
 		return
 	}
 	if len(r.Imports) == 0 {
-		fmt.Fprintln(out, "The import table yielded no symbols for this static reading. Silence in an import table is not evidence about runtime behavior.")
+		fmt.Fprintln(out, noImportsSentence)
 		return
 	}
 	fmt.Fprintln(out, "These are all of the imported symbols this static reading observed, grouped by the DLL that exports them. This tool has not assigned most of them a more specific description above; a name appearing here only means it was imported, not that it was examined.")
-	byDLL := make(map[string][]importSymbol)
-	for _, imp := range r.Imports {
-		byDLL[imp.DLL] = append(byDLL[imp.DLL], imp)
+	if hasDelayed(r.Imports) {
+		fmt.Fprintln(out, "A DLL marked (delay-loaded) was named in the delay-load import directory rather than the ordinary import table: its functions are resolved by name the first time each is called, instead of by the loader at startup.")
 	}
-	dlls := make([]string, 0, len(byDLL))
-	for dll := range byDLL {
-		dlls = append(dlls, dll)
-	}
-	sort.Slice(dlls, func(i, j int) bool { return strings.ToLower(dlls[i]) < strings.ToLower(dlls[j]) })
-	for _, dll := range dlls {
-		names := make([]string, 0, len(byDLL[dll]))
-		for _, imp := range byDLL[dll] {
-			names = append(names, imp.Symbol)
+	// sortImports leaves each DLL name, as spelled, together and split by
+	// directory, so each paragraph is one run of the same name read from the
+	// same directory.
+	imports := append([]importSymbol(nil), r.Imports...)
+	sortImports(imports)
+	for start := 0; start < len(imports); {
+		first := imports[start]
+		end := start
+		var names []string
+		for end < len(imports) && imports[end].DLL == first.DLL && imports[end].Delayed == first.Delayed {
+			names = append(names, imports[end].Symbol)
+			end++
 		}
-		fmt.Fprintf(out, "%s: %s.\n", dll, strings.Join(names, ", "))
+		fmt.Fprintf(out, "%s%s: %s.\n", first.DLL, delayedSuffix(first), strings.Join(names, ", "))
+		start = end
 	}
+}
+
+// noImportsSentence is what a report says when neither import directory
+// named a single function.
+const noImportsSentence = "Neither the import table nor the delay-load import directory yielded any named symbols for this static reading. Silence in an import table is not evidence about runtime behavior."
+
+func hasDelayed(imports []importSymbol) bool {
+	for _, imp := range imports {
+		if imp.Delayed {
+			return true
+		}
+	}
+	return false
 }
 func evidenceFor(table evidenceTable, imp importSymbol) (evidence, bool) {
 	for _, item := range table.Mapping {
@@ -740,7 +808,22 @@ func writeBlindSpots(out io.Writer, r *inspection) {
 		fmt.Fprintf(out, "Section(s) %s have entropy at or above 7.2 bits per byte, which can occur with compressed or packed data and makes static inspection less complete.\n", joinProse(parts))
 	}
 	if len(r.Imports) < 5 {
-		fmt.Fprintf(out, "The observed import table names only %d symbol(s). An implausibly small import table can occur when imports are resolved or reconstructed at runtime, but it is not proof of that.\n", len(r.Imports))
+		fmt.Fprintf(out, "The import table and delay-load import directory together name only %d symbol(s). An implausibly small import table can occur when imports are resolved or reconstructed at runtime, but it is not proof of that.\n", len(r.Imports))
+	}
+	if hasDelayed(r.Imports) || len(r.DelayOrdinals) > 0 {
+		fmt.Fprintln(out, "Delay-loaded imports are resolved by a helper routine inside this file the first time each is called. The delay-load import directory records what that helper is asked for; this static reading cannot see what the helper does with the request.")
+	}
+	if len(r.DelayOrdinals) > 0 {
+		dlls := make([]string, 0, len(r.DelayOrdinals))
+		for dll := range r.DelayOrdinals {
+			dlls = append(dlls, dll)
+		}
+		sort.Slice(dlls, func(i, j int) bool { return strings.ToLower(dlls[i]) < strings.ToLower(dlls[j]) })
+		parts := make([]string, 0, len(dlls))
+		for _, dll := range dlls {
+			parts = append(parts, fmt.Sprintf("%d from %s", r.DelayOrdinals[dll], dll))
+		}
+		fmt.Fprintf(out, "The delay-load import directory names some functions by ordinal only (%s). Which function an ordinal refers to is decided by the DLL, not recorded in this file, so they are neither described above nor listed in the appendix.\n", joinProse(parts))
 	}
 	if len(r.UnusualSections) == 0 {
 		fmt.Fprintln(out, "No section names outside this tool's small conventional-name set were observed; names alone cannot establish how code is stored.")
